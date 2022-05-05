@@ -20,7 +20,6 @@ import uuid
 import time
 
 from airflow.providers.google.cloud.operators.dataplex import DataplexCreateTaskOperator
-from airflow.providers.google.cloud.sensors.dataplex import DataplexTaskStateSensor
 from airflow.exceptions import AirflowFailException
 
 from google.cloud import dataplex_v1
@@ -80,14 +79,6 @@ with models.DAG(
         body=EXAMPLE_TASK_BODY,
         dataplex_task_id='{{ ti.xcom_pull(task_ids=\'gen_dataplex_task_id\') }}',
         task_id="dataplex_dq_task",
-    )
-
-    dataplex_task_state = DataplexTaskStateSensor(
-        project_id=PROJECT_ID,
-        region=REGION,
-        lake_id=LAKE_ID,
-        dataplex_task_id='{{ ti.xcom_pull(task_ids=\'gen_dataplex_task_id\') }}',
-        task_id="dataplex_task_state",
     )
 
     @task(task_id='check_task_completion')
