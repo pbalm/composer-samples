@@ -13,17 +13,14 @@
 # limitations under the License.
 
 import datetime
+from datetime import timedelta
 
 from airflow import models
 from airflow.decorators import task
-import uuid
-import time
+from airflow.utils.email import send_email
 
+from airflow.providers.google.cloud.operators.bigquery import BigQueryCheckOperator
 from airflow.providers.google.cloud.operators.dataplex import DataplexCreateTaskOperator
-from airflow.exceptions import AirflowFailException
-
-from google.cloud import dataplex_v1
-from google.cloud.dataplex_v1 import DataplexServiceClient
 
 
 PROJECT_ID = "pbalm-dataplex"
@@ -31,6 +28,8 @@ REGION = "us-central1"
 LAKE_ID = "main-lake"
 SERVICE_ACC = "28982355077-compute@developer.gserviceaccount.com"
 TRIGGER_SPEC_TYPE = "ON_DEMAND"
+
+EMAIL = 'pbalm@google.com'
 
 EXAMPLE_TASK_BODY = {
     "trigger_spec": {"type_": TRIGGER_SPEC_TYPE},
@@ -47,13 +46,13 @@ EXAMPLE_TASK_BODY = {
 }
 
 # for best practices
-YESTERDAY = datetime.datetime.now() - datetime.timedelta(days=1)
+YESTERDAY = datetime.datetime.now() - timedelta(days=1)
 
 default_args = {
-    'owner': 'Composer Example',
+    'owner': 'Dataplex Example',
     'depends_on_past': False,
-    'email': [''],
-    'email_on_failure': False,
+    'email': [EMAIL],
+    'email_on_failure': True,
     'email_on_retry': False,
     'retries': 1,
     'retry_delay': datetime.timedelta(minutes=5),
@@ -68,6 +67,8 @@ with models.DAG(
 
     @task(task_id='gen_dataplex_task_id')
     def gen_task_id():
+        import uuid
+
         task_id = "task-clouddq-" + str(uuid.uuid4())
         print(f'Generated task ID {task_id}')
         return task_id
@@ -81,8 +82,13 @@ with models.DAG(
         task_id="dataplex_dq_task",
     )
 
-    @task(task_id='check_task_completion')
+    @task(task_id='check_task_completion', sla=timedelta(minutes=15))
     def check_task_completion(**kwargs):
+        import time
+        from airflow.exceptions import AirflowFailException
+        from google.cloud import dataplex_v1
+        from google.cloud.dataplex_v1 import DataplexServiceClient
+
         client = DataplexServiceClient()
 
         ti = kwargs['ti']
@@ -92,9 +98,7 @@ with models.DAG(
         )
 
         s = 0
-        cycle = 0
-        while s != 4 and cycle < 100:
-            cycle = cycle + 1
+        while s != 4:
             time.sleep(10) # seconds
             page_result = client.list_jobs(request=request)
             s = list(page_result)[0].state
@@ -104,4 +108,37 @@ with models.DAG(
         if s != 4:
             raise AirflowFailException(f'Task ID {task_id} job is in state {s}')
 
-    gen_task_id() >> create_dataplex_dq_task >> check_task_completion()
+    def send_error_email(context):
+        dag_run = context.get('dag_run')
+
+        subject = f"DAG {dag_run} found new data quality failures"
+        send_email(to=EMAIL, subject=subject, html_content="New data quality rule failures found.")
+
+    query = f'''
+        with all_invoke_ids as (
+          select invocation_id, execution_ts, failed_count,
+            dense_rank() over (order by execution_ts desc) as rk
+          from `{PROJECT_ID}.clouddq_project.composer-summary`
+        ),
+        
+        results as (
+          select invocation_id, execution_ts, failed_count, rk,
+            lag(failed_count) over (order by rk desc) as prev_count,
+          from all_invoke_ids where rk <= 2
+          order by execution_ts desc
+        )
+        
+        select invocation_id, execution_ts, failed_count, failed_count - prev_count as increase
+        from results where rk = 1 and failed_count > prev_count
+    '''
+
+    check_dq_failures = BigQueryCheckOperator(
+        task_id="check_count",
+        sql=query,
+        use_legacy_sql=False,
+        location='US',
+        on_failure_callback=send_error_email,
+        'retries':0,
+    )
+
+    gen_task_id() >> create_dataplex_dq_task >> check_task_completion() >> check_dq_failures
