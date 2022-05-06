@@ -58,7 +58,7 @@ class DataplexJobCompletionSensor(BaseSensorOperator):
 
         page_result = client.list_jobs(request=request)
         s = list(page_result)[0].state
-        print(f'Task ID {task_id} job is in state {s}')
+        self.log.info(f'Task ID {task_id} job is in state {s}')
 
         if s == 5:
             raise AirflowFailException(f"Job for task ID {task_id} failed")
