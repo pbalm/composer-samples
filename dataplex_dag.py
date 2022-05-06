@@ -22,6 +22,8 @@ from airflow.utils.email import send_email
 from airflow.providers.google.cloud.operators.bigquery import BigQueryCheckOperator
 from airflow.providers.google.cloud.operators.dataplex import DataplexCreateTaskOperator
 
+from custom_task.dataplex_custom import DataplexJobCompletionSensor
+
 
 PROJECT_ID = "pbalm-dataplex"
 REGION = "us-central1"
@@ -53,17 +55,16 @@ default_args = {
     'depends_on_past': False,
     'email': [EMAIL],
     'email_on_failure': True,
-    'email_on_retry': False,
-    'retries': 1,
+    'retries': 0,
     'retry_delay': datetime.timedelta(minutes=5),
-    'start_date': YESTERDAY,
 }
 
 with models.DAG(
         'data_quality',
         catchup=False,
         default_args=default_args,
-        schedule_interval=datetime.timedelta(days=1)) as dag:
+        schedule_interval=datetime.timedelta(days=1),
+        start_date=YESTERDAY) as dag:
 
     @task(task_id='gen_dataplex_task_id')
     def gen_task_id():
@@ -72,6 +73,7 @@ with models.DAG(
         task_id = "task-clouddq-" + str(uuid.uuid4())
         print(f'Generated task ID {task_id}')
         return task_id
+
 
     create_dataplex_dq_task = DataplexCreateTaskOperator(
         project_id=PROJECT_ID,
@@ -82,31 +84,14 @@ with models.DAG(
         task_id="dataplex_dq_task",
     )
 
-    @task(task_id='check_task_completion', sla=timedelta(minutes=15))
-    def check_task_completion(**kwargs):
-        import time
-        from airflow.exceptions import AirflowFailException
-        from google.cloud import dataplex_v1
-        from google.cloud.dataplex_v1 import DataplexServiceClient
-
-        client = DataplexServiceClient()
-
-        ti = kwargs['ti']
-        task_id = ti.xcom_pull(task_ids='gen_dataplex_task_id')
-        request = dataplex_v1.ListJobsRequest(
-            parent=f'projects/{PROJECT_ID}/locations/{REGION}/lakes/{LAKE_ID}/tasks/{task_id}',
-        )
-
-        s = 0
-        while s != 4:
-            time.sleep(10) # seconds
-            page_result = client.list_jobs(request=request)
-            s = list(page_result)[0].state
-            print(f'Task ID {task_id} job is in state {s}')
-
-        # State 4 is SUCCESS
-        if s != 4:
-            raise AirflowFailException(f'Task ID {task_id} job is in state {s}')
+    check_completion = DataplexJobCompletionSensor(
+        task_id="wait_for_dq_job",
+        project_id=PROJECT_ID,
+        region=REGION,
+        lake_id=LAKE_ID,
+        task_id_generator='gen_dataplex_task_id',
+        timeout=15*60,
+    )
 
     def send_error_email(context):
         dag_run = context.get('dag_run')
@@ -128,17 +113,16 @@ with models.DAG(
           order by execution_ts desc
         )
         
-        select invocation_id, execution_ts, failed_count, failed_count - prev_count as increase
-        from results where rk = 1 and failed_count > prev_count
+        select invocation_id, execution_ts, failed_count <= prev_count as not_more_errors_found
+        from results where rk = 1
     '''
 
     check_dq_failures = BigQueryCheckOperator(
-        task_id="check_count",
+        task_id="check_dq_failures",
         sql=query,
         use_legacy_sql=False,
         location='US',
         on_failure_callback=send_error_email,
-        'retries':0,
     )
 
-    gen_task_id() >> create_dataplex_dq_task >> check_task_completion() >> check_dq_failures
+    gen_task_id() >> create_dataplex_dq_task >> check_completion >> check_dq_failures
